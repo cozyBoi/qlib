@@ -55,7 +55,7 @@ task:
         class: LSTMNN
         module_path: qlib.contrib.model.lstm_nn
         kwargs:
-            alpha_feat_dim: 6
+            alpha_feat_dim: 20
             embed_vector_dim: 64
             embed_feat_count: 16
             nn_hidden: 16

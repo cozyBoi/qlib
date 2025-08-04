@@ -1,13 +1,10 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
-
-
 from __future__ import division
 from __future__ import print_function
 
 import numpy as np
 import pandas as pd
-from typing import Text, Union
 import copy
 from ...utils import get_or_create_path
 from ...log import get_module_logger
@@ -15,12 +12,14 @@ from ...log import get_module_logger
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.data import DataLoader
 
 from ...model.base import Model
-from ...data.dataset import DatasetH
 from ...data.dataset.handler import DataHandlerLP
+from ...model.utils import ConcatDataset
+from ...data.dataset.weight import Reweighter
 
-class LSTMNN(nn.Module):
+class LSTMNN(Model):
     def __init__(
         self,
         alpha_feat_dim=6,    # e.g., 6
@@ -37,6 +36,7 @@ class LSTMNN(nn.Module):
         early_stop=20,
         loss="mse",
         optimizer="adam",
+        n_jobs=10,
         GPU=0,
         seed=None,
         **kwargs,
@@ -58,6 +58,7 @@ class LSTMNN(nn.Module):
         self.optimizer = optimizer.lower()
         self.loss = loss
         self.device = torch.device("cuda:%d" % (GPU) if torch.cuda.is_available() and GPU >= 0 else "cpu")
+        self.n_jobs = n_jobs
         self.seed = seed
         self.alpha_feat_dim = alpha_feat_dim
         self.embed_vector_dim = embed_vector_dim
@@ -126,15 +127,18 @@ class LSTMNN(nn.Module):
     def use_gpu(self):
         return self.device != torch.device("cpu")
 
-    def mse(self, pred, label):
-        loss = (pred - label) ** 2
+    def mse(self, pred, label, weight):
+        loss = weight * (pred - label) ** 2
         return torch.mean(loss)
 
-    def loss_fn(self, pred, label):
+    def loss_fn(self, pred, label, weight):
         mask = ~torch.isnan(label)
 
+        if weight is None:
+            weight = torch.ones_like(label)
+
         if self.loss == "mse":
-            return self.mse(pred[mask], label[mask])
+            return self.mse(pred[mask], label[mask], weight[mask])
 
         raise ValueError("unknown loss `%s`" % self.loss)
 
@@ -142,55 +146,38 @@ class LSTMNN(nn.Module):
         mask = torch.isfinite(label)
 
         if self.metric in ("", "loss"):
-            return -self.loss_fn(pred[mask], label[mask])
+            return -self.loss_fn(pred[mask], label[mask], weight=None)
 
         raise ValueError("unknown metric `%s`" % self.metric)
 
-    def train_epoch(self, x_train, y_train):
-        x_train_values = x_train.values
-        y_train_values = np.squeeze(y_train.values)
-
+    def train_epoch(self, data_loader):
         self.lstm_nn_model.train()
 
-        indices = np.arange(len(x_train_values))
-        np.random.shuffle(indices)
+        for data, weight in data_loader:
+            feature = data[:, :, 0:-1].to(self.device)
+            label = data[:, -1, -1].to(self.device)
 
-        for i in range(len(indices))[:: self.batch_size]:
-            if len(indices) - i < self.batch_size:
-                break
-
-            feature = torch.from_numpy(x_train_values[indices[i : i + self.batch_size]]).float().to(self.device)
-            label = torch.from_numpy(y_train_values[indices[i : i + self.batch_size]]).float().to(self.device)
-
-            pred = self.lstm_nn_model(feature)
-            loss = self.loss_fn(pred, label)
+            pred = self.lstm_nn_model(feature.float())
+            loss = self.loss_fn(pred, label, weight.to(self.device))
 
             self.train_optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_value_(self.lstm_nn_model.parameters(), 3.0)
             self.train_optimizer.step()
 
-    def test_epoch(self, data_x, data_y):
-        # prepare training data
-        x_values = data_x.values
-        y_values = np.squeeze(data_y.values)
-
+    def test_epoch(self, data_loader):
         self.lstm_nn_model.eval()
 
         scores = []
         losses = []
 
-        indices = np.arange(len(x_values))
+        for data, weight in data_loader:
+            feature = data[:, :, 0:-1].to(self.device)
+            # feature[torch.isnan(feature)] = 0
+            label = data[:, -1, -1].to(self.device)
 
-        for i in range(len(indices))[:: self.batch_size]:
-            if len(indices) - i < self.batch_size:
-                break
-
-            feature = torch.from_numpy(x_values[indices[i : i + self.batch_size]]).float().to(self.device)
-            label = torch.from_numpy(y_values[indices[i : i + self.batch_size]]).float().to(self.device)
-
-            pred = self.lstm_nn_model(feature)
-            loss = self.loss_fn(pred, label)
+            pred = self.lstm_nn_model(feature.float())
+            loss = self.loss_fn(pred, label, weight.to(self.device))
             losses.append(loss.item())
 
             score = self.metric_fn(pred, label)
@@ -200,30 +187,45 @@ class LSTMNN(nn.Module):
 
     def fit(
         self,
-        dataset: DatasetH,
+        dataset,
         evals_result=dict(),
         save_path=None,
+        reweighter=None,
     ):
-        df_train, df_valid, df_test = dataset.prepare(
-            ["train", "valid", "test"],
-            col_set=["feature", "label"],
-            data_key=DataHandlerLP.DK_L,
-        )
-        if df_train.empty or df_valid.empty:
+        dl_train = dataset.prepare("train", col_set=["feature", "label"], data_key=DataHandlerLP.DK_L)
+        dl_valid = dataset.prepare("valid", col_set=["feature", "label"], data_key=DataHandlerLP.DK_L)
+        if dl_train.empty or dl_valid.empty:
             raise ValueError("Empty data from dataset, please check your dataset config.")
 
-        if isinstance(df_train, pd.DataFrame):
-            x_train, y_train = df_train["feature"], df_train["label"]
-            x_valid, y_valid = df_valid["feature"], df_valid["label"]
-        elif hasattr(df_train, "to_dataframe"):
-            df_train = df_train.to_dataframe()
-            df_valid = df_valid.to_dataframe()
-            x_train, y_train = df_train["feature"], df_train["label"]
-            x_valid, y_valid = df_valid["feature"], df_valid["label"]
+        dl_train.config(fillna_type="ffill+bfill")  # process nan brought by dataloader
+        dl_valid.config(fillna_type="ffill+bfill")  # process nan brought by dataloader
+
+        if reweighter is None:
+            wl_train = np.ones(len(dl_train))
+            wl_valid = np.ones(len(dl_valid))
+        elif isinstance(reweighter, Reweighter):
+            wl_train = reweighter.reweight(dl_train)
+            wl_valid = reweighter.reweight(dl_valid)
         else:
-            raise TypeError(f"Unsupported data type: {type(df_train)}")
+            raise ValueError("Unsupported reweighter type.")
+
+        train_loader = DataLoader(
+            ConcatDataset(dl_train, wl_train),
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.n_jobs,
+            drop_last=True,
+        )
+        valid_loader = DataLoader(
+            ConcatDataset(dl_valid, wl_valid),
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.n_jobs,
+            drop_last=True,
+        )
 
         save_path = get_or_create_path(save_path)
+
         stop_steps = 0
         train_loss = 0
         best_score = -np.inf
@@ -238,10 +240,10 @@ class LSTMNN(nn.Module):
         for step in range(self.n_epochs):
             self.logger.info("Epoch%d:", step)
             self.logger.info("training...")
-            self.train_epoch(x_train, y_train)
+            self.train_epoch(train_loader)
             self.logger.info("evaluating...")
-            train_loss, train_score = self.test_epoch(x_train, y_train)
-            val_loss, val_score = self.test_epoch(x_valid, y_valid)
+            train_loss, train_score = self.test_epoch(train_loader)
+            val_loss, val_score = self.test_epoch(valid_loader)
             self.logger.info("train %.6f, valid %.6f" % (train_score, val_score))
             evals_result["train"].append(train_score)
             evals_result["valid"].append(val_score)
@@ -264,28 +266,25 @@ class LSTMNN(nn.Module):
         if self.use_gpu:
             torch.cuda.empty_cache()
 
-    def predict(self, dataset: DatasetH, segment: Union[Text, slice] = "test"):
+    def predict(self, dataset):
         if not self.fitted:
             raise ValueError("model is not fitted yet!")
 
-        x_test = dataset.prepare(segment, col_set="feature", data_key=DataHandlerLP.DK_I)
-        index = x_test.index
+        dl_test = dataset.prepare("test", col_set=["feature", "label"], data_key=DataHandlerLP.DK_I)
+        dl_test.config(fillna_type="ffill+bfill")
+        test_loader = DataLoader(dl_test, batch_size=self.batch_size, num_workers=self.n_jobs)
         self.lstm_nn_model.eval()
-        x_values = x_test.values
-        sample_num = x_values.shape[0]
         preds = []
 
-        for begin in range(sample_num)[:: self.batch_size]:
-            if sample_num - begin < self.batch_size:
-                end = sample_num
-            else:
-                end = begin + self.batch_size
-            x_batch = torch.from_numpy(x_values[begin:end]).float().to(self.device)
+        for data in test_loader:
+            feature = data[:, :, 0:-1].to(self.device)
+
             with torch.no_grad():
-                pred = self.lstm_nn_model(x_batch).detach().cpu().numpy()
+                pred = self.lstm_nn_model(feature.float()).detach().cpu().numpy()
+
             preds.append(pred)
 
-        return pd.Series(np.concatenate(preds), index=index)
+        return pd.Series(np.concatenate(preds), index=dl_test.get_index())
 
 class LSTMNNModel(nn.Module):
     def __init__(
@@ -302,7 +301,7 @@ class LSTMNNModel(nn.Module):
 
         # LSTM for Alpha158 features
         self.lstm = nn.LSTM(
-            input_size=alpha_feat_dim,
+            input_size=alpha_feat_dim + embed_feat_count * nn_out,
             hidden_size=hidden_size,
             num_layers=lstm_layers,
             dropout=dropout,
@@ -317,6 +316,7 @@ class LSTMNNModel(nn.Module):
         )
         self.embed_vector_dim = embed_vector_dim
         self.embed_feat_count = embed_feat_count
+        self.alpha_feat_dim = alpha_feat_dim
 
         # last layer
         self.fc_out = nn.Linear(hidden_size, 1)
