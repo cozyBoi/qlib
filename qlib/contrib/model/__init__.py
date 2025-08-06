@@ -34,6 +34,7 @@ try:
     from .pytorch_sfm import SFM_Model
     from .pytorch_tcn import TCN
     from .pytorch_add import ADD
+    from .lstm_nn import LSTMNN
 
     pytorch_classes = (ALSTM, GATs, GRU, LSTM, DNNModelPytorch, TabnetModel, SFM_Model, TCN, ADD)
 except ModuleNotFoundError:
